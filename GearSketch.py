@@ -758,12 +758,8 @@ def draw_spur_param(sketch, C_sp, prm, prefix=None, centerline=None, pitch=None,
         pitch = circles.addByCenterRadius(C_sp, d['r'])
         pitch.isConstruction = True
         dims.addDiameterDimension(pitch, adsk.core.Point3D.create(C.x + d['r'] * 0.7, C.y - d['r'] * 0.7, 0))
-    else:
-        for i in range(dims.count):
-            dm = dims.item(i)
-            if dm.objectType == adsk.fusion.SketchDiameterDimension.classType() and dm.entity == pitch:
-                dm.parameter.value = 2 * d['r']
-                break
+    elif not _set_pitch_diameter(sketch, pitch, d['r']):
+        dims.addDiameterDimension(pitch, adsk.core.Point3D.create(C.x + d['r'] * 0.7, C.y - d['r'] * 0.7, 0))
     if centerline is None:
         th = prm.get('angle', math.pi / 2)
         e = adsk.core.Point3D.create(C.x + d['r'] * math.cos(th), C.y + d['r'] * math.sin(th), 0)
@@ -882,14 +878,135 @@ def draw_spur_param(sketch, C_sp, prm, prefix=None, centerline=None, pitch=None,
 
     for c in created:
         _tag(c, pre)
-    keep = {k: prm[k] for k in ('module', 'teeth', 'pa', 'shift', 'ha', 'hf', 'root_r', 'thin', 'hole') if k in prm}
-    keep['prefix'] = pre
-    a = centerline.attributes.itemByName(ATTR_GROUP, ATTR_GEAR)
+    keep = {k: prm[k] for k in ('module', 'teeth', 'pa', 'shift', 'ha', 'hf', 'root_r', 'thin', 'hole', 'angle') if k in prm}
+    keep.update(prefix=pre, mode='param')
+    _set_gear_attr(centerline, keep, others=(pitch,))
+    return {'prefix': pre, 'teeth': d['z'], 'd': d, 'centerline': centerline, 'pitch': pitch}
+
+
+def _set_gear_attr(holder, keep, others=()):
+    for o in others:
+        try:
+            a = o.attributes.itemByName(ATTR_GROUP, ATTR_GEAR) if o else None
+            if a:
+                a.deleteMe()
+        except Exception:
+            pass
+    a = holder.attributes.itemByName(ATTR_GROUP, ATTR_GEAR)
     if a:
         a.value = json.dumps(keep)
     else:
-        centerline.attributes.add(ATTR_GROUP, ATTR_GEAR, json.dumps(keep))
+        holder.attributes.add(ATTR_GROUP, ATTR_GEAR, json.dumps(keep))
+
+
+def _spur_tooth_segments(h):
+    """歯1枚 (歯溝中心→次の歯溝中心) を局所座標の区間列にする。
+    ('A', mid, end) 円弧 / ('L', end) 直線 / ('S', [点...]) スプライン (始点は直前の終点)"""
+    d = h['d']
+    rf, ra = d['rf'], d['ra']
+    G, Rt, Fc, Ft, B, fit, T = h['G'], h['Rt'], h['Fc'], h['Ft'], h['B'], h['fit'], h['T']
+    mir = lambda q: (q[0], -q[1])
+    ang = lambda q: math.atan2(q[1], q[0])
+    foot = Rt if Fc else Ft
+    seg = [('A', _pol(rf, (ang(G) + ang(foot)) / 2), foot)]
+    if Fc:
+        seg.append(('A', _fillet_mid(Fc, Rt, Ft), Ft))
+    if B:
+        seg.append(('L', B))
+    seg.append(('S', fit[1:]))
+    seg.append(('A', (ra, 0.0), mir(T)))
+    seg.append(('S', [mir(q) for q in reversed(fit[:-1])]))
+    if B:
+        seg.append(('L', mir(Ft)))
+    if Fc:
+        seg.append(('A', mir(_fillet_mid(Fc, Rt, Ft)), mir(Rt)))
+    seg.append(('A', mir(_pol(rf, (ang(G) + ang(foot)) / 2)), mir(G)))
+    return seg
+
+
+def draw_spur_fixed(sketch, C_sp, prm, prefix=None, pitch=None, centerline=None, dry_run=False):
+    """拘束を付けずに全歯を描く (固定形状)。中心とピッチ円(補助)だけ共有する。"""
+    h = spur_half(prm)
+    d = h['d']
+    if dry_run:
+        return {'teeth': d['z']}
+    des = adsk.fusion.Design.cast(sketch.parentComponent.parentDesign)
+    pre = prefix or _next_gear_prefix(des)
+    circles = sketch.sketchCurves.sketchCircles
+    C = C_sp.geometry
+    if pitch is None:
+        pitch = circles.addByCenterRadius(C_sp, d['r'])
+        pitch.isConstruction = True
+    else:
+        _set_pitch_diameter(sketch, pitch, d['r'])
+    if centerline is not None:
+        s0, s1 = centerline.startSketchPoint.geometry, centerline.endSketchPoint.geometry
+        th0 = math.atan2(s1.y - s0.y, s1.x - s0.x)
+    else:
+        th0 = prm.get('angle', math.pi / 2)
+    seg = _spur_tooth_segments(h)
+    created = []
+    lines = sketch.sketchCurves.sketchLines
+    arcs = sketch.sketchCurves.sketchArcs
+    was = sketch.isComputeDeferred
+    sketch.isComputeDeferred = True
+    try:
+        cur = None
+        first = None
+        z = d['z']
+        for k in range(z):
+            th = th0 + 2 * math.pi * k / z
+            ct, st = math.cos(th), math.sin(th)
+
+            def P(q):
+                return adsk.core.Point3D.create(C.x + q[0] * ct - q[1] * st, C.y + q[0] * st + q[1] * ct, 0)
+            if cur is None:
+                cur = P(h['G'])
+            for i, sg in enumerate(seg):
+                last = (k == z - 1 and i == len(seg) - 1)
+                if sg[0] == 'A':
+                    endp = first if last else P(sg[2])
+                    a = arcs.addByThreePoints(cur, P(sg[1]), endp)
+                    tgt = endp.geometry if last else endp
+                    sp_, ep_ = a.startSketchPoint, a.endSketchPoint
+                    near_end = sp_ if sp_.geometry.distanceTo(tgt) < ep_.geometry.distanceTo(tgt) else ep_
+                    if first is None:
+                        first = ep_ if near_end == sp_ else sp_
+                    cur = near_end
+                    created.append(a)
+                elif sg[0] == 'L':
+                    ln = lines.addByTwoPoints(cur, P(sg[1]))
+                    cur = ln.endSketchPoint
+                    created.append(ln)
+                else:
+                    oc = adsk.core.ObjectCollection.create()
+                    oc.add(cur)
+                    for q in sg[1]:
+                        oc.add(P(q))
+                    sp = sketch.sketchCurves.sketchFittedSplines.add(oc)
+                    cur = sp.fitPoints.item(sp.fitPoints.count - 1)
+                    created.append(sp)
+        if prm.get('hole', 0) > 1e-9:
+            created.append(circles.addByCenterRadius(C_sp, prm['hole'] / 2))
+    finally:
+        sketch.isComputeDeferred = was
+    for c in created:
+        _tag(c, pre)
+    keep = {k: prm[k] for k in ('module', 'teeth', 'pa', 'shift', 'ha', 'hf', 'root_r', 'thin', 'hole', 'angle') if k in prm}
+    keep.update(prefix=pre, mode='fixed')
+    _set_gear_attr(pitch, keep, others=(centerline,))
     return {'prefix': pre, 'teeth': d['z'], 'd': d, 'centerline': centerline, 'pitch': pitch}
+
+
+def _set_pitch_diameter(sketch, pitch, r):
+    dims = sketch.sketchDimensions
+    for i in range(dims.count):
+        dm = dims.item(i)
+        if dm.objectType == adsk.fusion.SketchDiameterDimension.classType() and dm.entity == pitch:
+            dm.parameter.value = 2 * r
+            return True
+    pitch.radius = r
+    return False
 
 
 def _pattern_owner_prefix(entity, sketch):
@@ -911,31 +1028,40 @@ def _pattern_owner_prefix(entity, sketch):
 
 
 def find_gear(entity):
-    """選択要素が既存ギアの一部(または中心線)なら (sketch, center, centerline, pitch, prefix, params) を返す。"""
+    """選択要素が既存ギアの一部なら (sketch, center, centerline, pitch, prefix, params) を返す。
+    パラメトリックは歯の中心線に、固定形状はピッチ円に設定を保存している。"""
     sk = entity.parentSketch
-    v = _attr(entity, ATTR_GEAR)
-    if v:
-        cl = entity
-    else:
+    holder = entity if _attr(entity, ATTR_GEAR) else None
+    if holder is None:
         pre = _attr(entity, ATTR_MEMBER) or _pattern_owner_prefix(entity, sk)
         if not pre:
             return None
-        cl = None
-        for ln in sk.sketchCurves.sketchLines:
-            v = _attr(ln, ATTR_GEAR)
-            if v and json.loads(v).get('prefix') == pre:
-                cl = ln
+        for coll in (sk.sketchCurves.sketchLines, sk.sketchCurves.sketchCircles):
+            for c in coll:
+                v = _attr(c, ATTR_GEAR)
+                if v and json.loads(v).get('prefix') == pre:
+                    holder = c
+                    break
+            if holder:
                 break
-        if cl is None:
+        if holder is None:
             return None
-    prm = json.loads(_attr(cl, ATTR_GEAR))
-    C_sp = cl.startSketchPoint
-    pitch = None
-    for c in sk.sketchCurves.sketchCircles:
-        if c.isConstruction and c.centerSketchPoint == C_sp:
-            for gcn in cl.endSketchPoint.geometricConstraints:
-                if gcn.objectType == adsk.fusion.CoincidentConstraint.classType() and gcn.entity == c:
-                    pitch = c
+    prm = json.loads(_attr(holder, ATTR_GEAR))
+    if holder.objectType == adsk.fusion.SketchLine.classType():
+        cl, C_sp = holder, holder.startSketchPoint
+        pitch = None
+        for c in sk.sketchCurves.sketchCircles:
+            if c.isConstruction and c.centerSketchPoint == C_sp:
+                for gcn in cl.endSketchPoint.geometricConstraints:
+                    if gcn.objectType == adsk.fusion.CoincidentConstraint.classType() and gcn.entity == c:
+                        pitch = c
+    else:
+        pitch, C_sp, cl = holder, holder.centerSketchPoint, None
+        for ln in sk.sketchCurves.sketchLines:      # 以前パラメトリックだったときの中心線が残っていれば使う
+            if ln.isConstruction and ln.startSketchPoint == C_sp:
+                for gcn in ln.endSketchPoint.geometricConstraints:
+                    if gcn.objectType == adsk.fusion.CoincidentConstraint.classType() and gcn.entity == pitch:
+                        cl = ln
     return sk, C_sp, cl, pitch, prm['prefix'], prm
 
 
@@ -1224,6 +1350,8 @@ class ValidateHandler(adsk.core.ValidateInputsEventHandler):
 
 SPUR_CMD_ID = 'GearSketch_Spur'
 SPUR_CMD_NAME = '平歯車 (モジュール指定)'
+SPUR_FIXED = '固定形状 (拘束なし・軽い)'
+SPUR_PARAM = 'パラメトリック (まとめて動く)'
 
 
 def _spur_target(sel):
@@ -1241,6 +1369,7 @@ def _spur_params(inp):
         'module': v('module'), 'teeth': v('teeth'), 'pa': v('pa'), 'shift': v('shift'),
         'angle': v('angle'), 'hole': v('hole'),
         'ha': v('ha'), 'hf': v('hf'), 'root_r': v('root_r'), 'thin': v('thin'),
+        'mode': 'param' if inp.itemById('mode').selectedItem.name == SPUR_PARAM else 'fixed',
     }
 
 
@@ -1254,6 +1383,10 @@ def _spur_load(inputs, target):
             inputs.itemById(k).value = prm[k]
     if 'teeth' in prm:
         inputs.itemById('teeth').value = int(prm['teeth'])
+    if 'angle' in prm:
+        inputs.itemById('angle').value = prm['angle']
+    for it in inputs.itemById('mode').listItems:
+        it.isSelected = (it.name == (SPUR_PARAM if prm.get('mode', 'param') == 'param' else SPUR_FIXED))
     inputs.itemById('status').text = '既存のギア {} を編集します。OK で同じ中心・中心線・ピッチ円のまま作り直します。'.format(pre)
 
 
@@ -1290,18 +1423,19 @@ def _spur_do(inputs):
     prm = _spur_params(inputs)
     target = _spur_target(sel)
     try:
+        draw = draw_spur_param if prm['mode'] == 'param' else draw_spur_fixed
         if target is not None:
             sk, C_sp, cl, pitch, pre, _old = target
-            draw_spur_param(sk, C_sp, prm, dry_run=True)        # 失敗するなら既存ギアを消さない
+            draw(sk, C_sp, prm, dry_run=True)        # 失敗するなら既存ギアを消さない
             delete_gear(sk, pre)
-            info = draw_spur_param(sk, C_sp, prm, prefix=pre, centerline=cl, pitch=pitch)
+            info = draw(sk, C_sp, prm, prefix=pre, centerline=cl, pitch=pitch)
         else:
             C_sp = _spur_center(sel, sketch)
             if C_sp is None:
                 status.text = '中心にする点 (または円) を選んでください'
                 return False
-            draw_spur_param(sketch, C_sp, prm, dry_run=True)
-            info = draw_spur_param(sketch, C_sp, prm)
+            draw(sketch, C_sp, prm, dry_run=True)
+            info = draw(sketch, C_sp, prm)
     except RackError as e:
         status.text = str(e)
         return False
@@ -1319,6 +1453,9 @@ class SpurCreatedHandler(adsk.core.CommandCreatedEventHandler):
             s.addSelectionFilter('SketchPoints')
             s.addSelectionFilter('SketchCurves')
             s.setSelectionLimits(1, 1)
+            dd = inp.addDropDownCommandInput('mode', '作り方', adsk.core.DropDownStyles.TextListDropDownStyle)
+            dd.listItems.add(SPUR_FIXED, True)
+            dd.listItems.add(SPUR_PARAM, False)
             inp.addValueInput('module', 'モジュール', 'mm', VI('1 mm'))
             inp.addIntegerSpinnerCommandInput('teeth', '歯数', 4, 10000, 1, 20)
             inp.addValueInput('pa', '圧力角', 'deg', VI('20 deg'))
@@ -1399,10 +1536,21 @@ class SpurValidateHandler(adsk.core.ValidateInputsEventHandler):
 # 登録
 # ---------------------------------------------------------------------------
 
+import os
+
+_RES = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resources')
+DROPDOWN_ID = 'GearSketch_DropDown'
+DROPDOWN_TEXT = 'GearSketch'
+
 _COMMANDS = [
-    (CMD_ID, CMD_NAME, '選んだ線(2点)に沿って、指定モジュールのラック歯形をスケッチします', CreatedHandler),
-    (SPUR_CMD_ID, SPUR_CMD_NAME, '選んだ点を中心に、指定モジュール・歯数の平歯車をスケッチします', SpurCreatedHandler),
+    (SPUR_CMD_ID, SPUR_CMD_NAME, '選んだ点を中心に、指定モジュール・歯数の平歯車をスケッチします', SpurCreatedHandler, 'Spur'),
+    (CMD_ID, CMD_NAME, '選んだ線(2点)に沿って、指定モジュールのラック歯形をスケッチします', CreatedHandler, 'Rack'),
 ]
+
+
+def _res(name):
+    p = os.path.join(_RES, name)
+    return p if os.path.isdir(p) else ''
 
 
 def run(context):
@@ -1411,16 +1559,26 @@ def run(context):
         _app = adsk.core.Application.get()
         _ui = _app.userInterface
         panel = _ui.allToolbarPanels.itemById(PANEL_ID)
-        for cid, name, tip, handler_cls in _COMMANDS:
+        dd = None
+        if panel:
+            old = panel.controls.itemById(DROPDOWN_ID)
+            if old:
+                old.deleteMe()
+            for cid, *_rest in _COMMANDS:          # 旧版でパネル直下に置いたボタンを片付ける
+                c = panel.controls.itemById(cid)
+                if c:
+                    c.deleteMe()
+            dd = panel.controls.addDropDown(DROPDOWN_TEXT, _res('GearSketch'), DROPDOWN_ID)
+        for cid, name, tip, handler_cls, icon in _COMMANDS:
             d = _ui.commandDefinitions.itemById(cid)
             if d:
                 d.deleteMe()
-            d = _ui.commandDefinitions.addButtonDefinition(cid, name, tip)
+            d = _ui.commandDefinitions.addButtonDefinition(cid, name, tip, _res(icon))
             h = handler_cls()
             d.commandCreated.add(h)
             _handlers.append(h)
-            if panel and not panel.controls.itemById(cid):
-                panel.controls.addCommand(d)
+            if dd:
+                dd.controls.addCommand(d)
     except Exception:
         if _ui:
             _ui.messageBox('GearSketch の起動に失敗:\n' + traceback.format_exc())
@@ -1429,10 +1587,11 @@ def run(context):
 def stop(context):
     try:
         panel = _ui.allToolbarPanels.itemById(PANEL_ID)
-        for cid, _n, _t, _h in _COMMANDS:
-            c = panel.controls.itemById(cid) if panel else None
-            if c:
-                c.deleteMe()
+        if panel:
+            dd = panel.controls.itemById(DROPDOWN_ID)
+            if dd:
+                dd.deleteMe()
+        for cid, *_rest in _COMMANDS:
             d = _ui.commandDefinitions.itemById(cid)
             if d:
                 d.deleteMe()
