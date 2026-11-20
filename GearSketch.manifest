@@ -1,0 +1,11 @@
+{
+	"autodeskProduct":	"Fusion",
+	"type":	"addin",
+	"author":	"oumuika",
+	"description":	{
+		"":	"スケッチ中に任意モジュールのギア・ラックを描くアドイン"
+	},
+	"supportedOS":	"windows|mac",
+	"editEnabled":	true,
+	"runOnStartup":	true
+}
