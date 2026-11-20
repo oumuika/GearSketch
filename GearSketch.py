@@ -1263,8 +1263,8 @@ class CreatedHandler(adsk.core.CommandCreatedEventHandler):
             s.setSelectionLimits(1, 2)
 
             dd = inp.addDropDownCommandInput('mode', '作り方', adsk.core.DropDownStyles.TextListDropDownStyle)
-            dd.listItems.add(MODE_PARAM, True)
-            dd.listItems.add(MODE_FIXED, False)
+            dd.listItems.add(MODE_FIXED, True)
+            dd.listItems.add(MODE_PARAM, False)
             inp.addValueInput('module', 'モジュール', 'mm', VI('1 mm'))
             inp.addValueInput('pa', '圧力角', 'deg', VI('20 deg'))
             dd = inp.addDropDownCommandInput('ref', '選んだ線の位置', adsk.core.DropDownStyles.TextListDropDownStyle)
