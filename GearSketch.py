@@ -1,14 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-GearSketch - Autodesk Fusion アドイン (ラック)
-スケッチ編集中に「作成」メニューの「ラック (モジュール指定)」から、
-選んだ2点(または1本の線)の間に、任意モジュールのラック歯形をスケッチします。
+GearSketch - Autodesk Fusion アドイン
+スケッチ編集中に「作成」メニューから、任意モジュールのギアをスケッチします。
 
-  - 2点を結ぶ線 = 基準線 (ピッチ線 / 歯底線 / 歯先線 から選択)
-  - モジュール、圧力角、歯先・歯元の係数、歯元R・歯先R、歯厚減少量(バックラッシ)
-  - 始点を歯溝の中心 / 歯の中心に合わせる + 位相オフセット
-  - 閉じた輪郭(背面付き)にすれば、そのまま押し出し可能
-  - 端は指定した2点の位置で歯形を正確に切ります
+  ラック (モジュール指定)
+    - 選んだ線(または2点)を基準線にしてラック歯形を描く
+    - パラメトリック: 歯1枚を拘束で定義してピッチ線方向にパターン → ピッチ線と一体で動く
+    - 固定形状: 選んだ2点の位置で歯形を正確に切る
+
+  平歯車 (モジュール指定)
+    - 選んだ点(または円の中心)を中心に、インボリュート歯形の平歯車を描く
+    - 歯1枚を中心点と「歯の中心線」に対して拘束し、円形パターンで並べる
+      → 中心を動かすと移動、中心線を回すと回転、歯をドラッグすると一体で動く
+    - ピッチ円(補助円)を作るので、ラックのピッチ線や相手ギアのピッチ円と拘束して噛み合わせられる
+
+  どちらも、既存のラック/ギアの線を選んでコマンドを実行すると設定を読み込み、作り直せます。
 
 単位: API 内部は cm。
 """
@@ -561,6 +567,399 @@ def draw_rack_param(sketch, PL, prm, prefix=None, dry_run=False):
     else:
         PL.attributes.add(ATTR_GROUP, ATTR_RACK, json.dumps(keep))
     return {'prefix': pre, 'teeth': N, 'pitch': p, 'length': L}
+
+
+# ===========================================================================
+# 平歯車
+#   ・歯1枚 (歯溝中心→歯溝中心) を、中心点と「歯の中心線」(補助線) に対して寸法と対称拘束で固定し、
+#     中心点まわりの円形パターンで並べる
+#   ・中心点を動かすと移動、中心線を回すと回転、歯をドラッグすると全体が一体で動く
+#   ・ピッチ円 (補助円) を作るので、ラックのピッチ線や相手ギアのピッチ円と拘束して噛み合わせられる
+#   ・歯数やモジュールの変更は、ギアを選んでコマンドを再実行 → 中心・中心線・ピッチ円を残して作り直す
+# ===========================================================================
+
+ATTR_GEAR = 'gear'   # 歯の中心線に付ける (値 = JSON パラメータ)
+
+
+class GearError(RackError):
+    pass
+
+
+def _inv(a):
+    return math.tan(a) - a
+
+
+def spur_dims(prm):
+    m, z = prm['module'], int(prm['teeth'])
+    a = prm['pa']
+    x = prm.get('shift', 0.0)
+    d = {'m': m, 'z': z, 'a': a, 'x': x}
+    d['r'] = m * z / 2.0
+    d['rb'] = d['r'] * math.cos(a)
+    d['ra'] = d['r'] + m * (prm.get('ha', 1.0) + x)
+    d['rf'] = d['r'] - m * (prm.get('hf', 1.25) - x)
+    d['rho'] = prm.get('root_r', 0.38) * m
+    s = m * (math.pi / 2 + 2 * x * math.tan(a)) - prm.get('thin', 0.0)   # ピッチ円上の歯厚
+    d['psi'] = s / (2 * d['r'])
+    d['gap'] = math.pi / z
+    return d
+
+
+def _flank_phi(d, R):
+    """下半分の歯面上、半径 R の点の角度。R>=rb はインボリュート、それ未満は基礎円から半径方向の直線。"""
+    rb = d['rb']
+    if R <= rb:
+        return -(d['psi'] + _inv(d['a']))
+    return -(d['psi'] + _inv(d['a']) - _inv(math.acos(rb / R)))
+
+
+def _pol(R, phi):
+    return (R * math.cos(phi), R * math.sin(phi))
+
+
+def spur_half(prm, n_fit=7):
+    """歯の中心線を +X とした局所座標で、歯の下半分 (φ<0) の要所を返す。"""
+    if prm['module'] <= 0:
+        raise GearError('モジュールは正の値にしてください')
+    if int(prm['teeth']) < 4:
+        raise GearError('歯数は 4 以上にしてください')
+    if not (math.radians(0.5) < prm['pa'] < math.radians(45)):
+        raise GearError('圧力角は 0.5°〜45° の範囲にしてください')
+    d = spur_dims(prm)
+    rb, ra, rf, rho, gap = d['rb'], d['ra'], d['rf'], d['rho'], d['gap']
+    if rf <= 0:
+        raise GearError('歯底円の半径が 0 以下になります (歯数が少なすぎるか、歯元のたけが大きすぎます)')
+    if _flank_phi(d, ra) >= -1e-9:
+        raise GearError('歯先が尖ってしまいます (転位係数か歯末のたけを小さくしてください)')
+    phi_foot = _flank_phi(d, rf)
+    if phi_foot <= -gap + 1e-9:
+        raise GearError('歯溝がなくなります (歯数・圧力角・転位係数・歯厚減少量を見直してください)')
+
+    out = {'d': d, 'G': _pol(rf, -gap)}
+    if rho > 1e-12:
+        # 歯面を細かい折れ線にして、歯底円と歯面の両方に接する半径 rho の円を二分法で求める
+        pts = [(rf, _flank_phi(d, rf))] if rf < rb else []
+        Rs = max(rf, rb)
+        ts, ta = math.sqrt(max(0.0, (Rs / rb) ** 2 - 1)), math.sqrt((ra / rb) ** 2 - 1)
+        for i in range(201):
+            t = ts + (ta - ts) * i / 200
+            R = rb * math.sqrt(1 + t * t)
+            pts.append((R, _flank_phi(d, R)))
+        poly = [_pol(R, p) for R, p in pts]
+
+        def nearest(c):
+            best, bq = 1e9, None
+            for (x1, y1), (x2, y2) in zip(poly[:-1], poly[1:]):
+                dx, dy = x2 - x1, y2 - y1
+                L2 = dx * dx + dy * dy
+                t = 0.0 if L2 == 0 else max(0.0, min(1.0, ((c[0] - x1) * dx + (c[1] - y1) * dy) / L2))
+                q = (x1 + t * dx, y1 + t * dy)
+                dd = math.hypot(q[0] - c[0], q[1] - c[1])
+                if dd < best:
+                    best, bq = dd, q
+            return best, bq
+
+        Rc = rf + rho
+        lo, hi = -gap, _flank_phi(d, Rc)
+        if nearest(_pol(Rc, lo))[0] < rho:
+            raise GearError('歯元R が大きすぎて歯溝に収まりません。歯元R係数を小さくしてください。')
+        for _ in range(80):
+            mid = (lo + hi) / 2
+            if nearest(_pol(Rc, mid))[0] > rho:
+                lo = mid
+            else:
+                hi = mid
+        phic = (lo + hi) / 2
+        Fc = _pol(Rc, phic)
+        RF = math.hypot(*nearest(Fc)[1])
+        out.update(Rt=_pol(rf, phic), Fc=Fc, Ft=_pol(RF, _flank_phi(d, RF)), R_foot=RF)
+    else:
+        out.update(Rt=None, Fc=None, Ft=_pol(rf, phi_foot), R_foot=rf)
+
+    if out['R_foot'] < rb - 1e-9:
+        out['B'] = _pol(rb, _flank_phi(d, rb))
+        Rs = rb
+    else:
+        out['B'] = None
+        Rs = out['R_foot']
+    ts, ta = math.sqrt(max(0.0, (Rs / rb) ** 2 - 1)), math.sqrt((ra / rb) ** 2 - 1)
+    fit = []
+    for i in range(n_fit):
+        t = ts + (ta - ts) * i / (n_fit - 1)
+        R = rb * math.sqrt(1 + t * t) if i < n_fit - 1 else ra
+        fit.append(_pol(R, _flank_phi(d, R)))
+    out['fit'] = fit            # fit[0] = 歯面の始点 (B か Ft), fit[-1] = 歯先 T
+    out['T'] = fit[-1]
+    return out
+
+
+def _fillet_mid(Fc, Rt, Ft):
+    a0 = math.atan2(Rt[1] - Fc[1], Rt[0] - Fc[0])
+    a1 = math.atan2(Ft[1] - Fc[1], Ft[0] - Fc[0])
+    da = (a1 - a0 + math.pi) % (2 * math.pi) - math.pi
+    am = a0 + da / 2
+    r = math.hypot(Rt[0] - Fc[0], Rt[1] - Fc[1])
+    return (Fc[0] + r * math.cos(am), Fc[1] + r * math.sin(am))
+
+
+def _nearest_end(curves, p3):
+    best, bp = 1e9, None
+    for c in curves:
+        for sp in (c.startSketchPoint, c.endSketchPoint):
+            dd = sp.geometry.distanceTo(p3)
+            if dd < best:
+                best, bp = dd, sp
+    return bp
+
+
+def _nearest_center(curves, p3):
+    best, bp = 1e9, None
+    for c in curves:
+        if c.objectType == adsk.fusion.SketchArc.classType():
+            dd = c.centerSketchPoint.geometry.distanceTo(p3)
+            if dd < best:
+                best, bp = dd, c.centerSketchPoint
+    return bp
+
+
+def _next_gear_prefix(des):
+    used = set()
+    for a in des.findAttributes(ATTR_GROUP, ATTR_GEAR):
+        try:
+            used.add(json.loads(a.value).get('prefix'))
+        except Exception:
+            pass
+    i = 1
+    while 'Gear{}'.format(i) in used:
+        i += 1
+    return 'Gear{}'.format(i)
+
+
+def draw_spur_param(sketch, C_sp, prm, prefix=None, centerline=None, pitch=None, dry_run=False):
+    """C_sp: 中心の SketchPoint。centerline / pitch: 作り直しのときに引き継ぐ中心線とピッチ円。"""
+    h = spur_half(prm)
+    d = h['d']
+    if dry_run:
+        return {'teeth': d['z']}
+    des = adsk.fusion.Design.cast(sketch.parentComponent.parentDesign)
+    pre = prefix or _next_gear_prefix(des)
+    VI = adsk.core.ValueInput.createByString
+    AL = adsk.fusion.DimensionOrientations.AlignedDimensionOrientation
+    gc = sketch.geometricConstraints
+    dims = sketch.sketchDimensions
+    lines = sketch.sketchCurves.sketchLines
+    arcs = sketch.sketchCurves.sketchArcs
+    circles = sketch.sketchCurves.sketchCircles
+    C = C_sp.geometry
+    created = []
+
+    # --- ピッチ円 (補助) と歯の中心線 (補助, ギアの回転を表す) ---
+    if pitch is None:
+        pitch = circles.addByCenterRadius(C_sp, d['r'])
+        pitch.isConstruction = True
+        dims.addDiameterDimension(pitch, adsk.core.Point3D.create(C.x + d['r'] * 0.7, C.y - d['r'] * 0.7, 0))
+    else:
+        for i in range(dims.count):
+            dm = dims.item(i)
+            if dm.objectType == adsk.fusion.SketchDiameterDimension.classType() and dm.entity == pitch:
+                dm.parameter.value = 2 * d['r']
+                break
+    if centerline is None:
+        th = prm.get('angle', math.pi / 2)
+        e = adsk.core.Point3D.create(C.x + d['r'] * math.cos(th), C.y + d['r'] * math.sin(th), 0)
+        centerline = lines.addByTwoPoints(C_sp, e)
+        centerline.isConstruction = True
+        gc.addCoincident(centerline.endSketchPoint, pitch)
+    s0, s1 = centerline.startSketchPoint.geometry, centerline.endSketchPoint.geometry
+    th = math.atan2(s1.y - s0.y, s1.x - s0.x)
+    ct, st = math.cos(th), math.sin(th)
+
+    def P(q, mirror=False):
+        x, y = q[0], (-q[1] if mirror else q[1])
+        return adsk.core.Point3D.create(C.x + x * ct - y * st, C.y + x * st + y * ct, 0)
+
+    def mid_arc(R, a0, a1):
+        return _pol(R, (a0 + a1) / 2)
+
+    def ang(q):
+        return math.atan2(q[1], q[0])
+
+    def tp(q, mirror=False, k=1.25):
+        return P((q[0] * k, q[1] * k), mirror)
+
+    st_ = {'cur': None}
+
+    def arc_to(mid, end, mirror=False):
+        endp = P(end, mirror)
+        a = arcs.addByThreePoints(st_['cur'], P(mid, mirror), endp)
+        s, e = a.startSketchPoint, a.endSketchPoint
+        st_['cur'] = s if s.geometry.distanceTo(endp) < e.geometry.distanceTo(endp) else e
+        created.append(a)
+        return a
+
+    def line_to(end, mirror=False):
+        ln = lines.addByTwoPoints(st_['cur'], P(end, mirror))
+        st_['cur'] = ln.endSketchPoint
+        created.append(ln)
+        return ln
+
+    def spline_to(pts, mirror=False):
+        oc = adsk.core.ObjectCollection.create()
+        oc.add(st_['cur'])
+        for q in pts[1:]:
+            oc.add(P(q, mirror))
+        sp = sketch.sketchCurves.sketchFittedSplines.add(oc)
+        created.append(sp)
+        fp = sp.fitPoints
+        st_['cur'] = fp.item(fp.count - 1)
+        return [fp.item(i) for i in range(fp.count)]
+
+    def dist_dim(pt, q, mirror=False):
+        dims.addDistanceDimension(C_sp, pt, AL, tp(q, mirror, 0.6))
+
+    def off_dim(pt, q, mirror=False):
+        dims.addOffsetDimension(centerline, pt, tp(q, mirror, 1.1))
+
+    rf, ra = d['rf'], d['ra']
+    G, Rt, Fc, Ft, B, fit, T = h['G'], h['Rt'], h['Fc'], h['Ft'], h['B'], h['fit'], h['T']
+
+    # ===== 下半分: 歯底円弧 → 歯元R → (基礎円までの直線) → インボリュート =====
+    st_['cur'] = P(G)
+    foot = Rt if Fc else Ft
+    a_root = arc_to(mid_arc(rf, ang(G), ang(foot)), foot)
+    gpt = a_root.startSketchPoint if a_root.endSketchPoint == st_['cur'] else a_root.endSketchPoint
+    gc.addCoincident(a_root.centerSketchPoint, C_sp)
+    dist_dim(gpt, G)
+    off_dim(gpt, G)
+    off_dim(st_['cur'], foot)
+    if Fc:
+        a_f = arc_to(_fillet_mid(Fc, Rt, Ft), Ft)
+        dist_dim(a_f.centerSketchPoint, Fc)
+        off_dim(a_f.centerSketchPoint, Fc)
+        off_dim(st_['cur'], Ft)
+    if B:
+        line_to(B)
+        dist_dim(st_['cur'], B)
+        off_dim(st_['cur'], B)
+    low_pts = spline_to(fit)
+    for pt, q in zip(low_pts[1:], fit[1:]):
+        dist_dim(pt, q)
+        off_dim(pt, q)
+
+    # ===== 歯先円弧 =====
+    a_tip = arc_to((ra, 0.0), T, mirror=True)
+    gc.addCoincident(a_tip.centerSketchPoint, C_sp)
+    off_dim(st_['cur'], T, mirror=True)
+
+    # ===== 上半分: 中心線に対して対称 =====
+    up_pts = list(reversed(spline_to(list(reversed(fit)), mirror=True)))
+    for i in range(1, len(fit) - 1):
+        gc.addSymmetry(low_pts[i], up_pts[i], centerline)
+    if B:
+        gc.addSymmetry(low_pts[0], up_pts[0], centerline)
+        line_to(Ft, mirror=True)
+    gc.addSymmetry(_nearest_end(created, P(Ft)), st_['cur'], centerline)
+    if Fc:
+        a_fu = arc_to(_fillet_mid(Fc, Rt, Ft), Rt, mirror=True)
+        gc.addSymmetry(_nearest_center(created[:-1], P(Fc)), a_fu.centerSketchPoint, centerline)
+        off_dim(st_['cur'], Rt, mirror=True)
+    a_root_u = arc_to(mid_arc(rf, ang(foot), ang(G)), G, mirror=True)
+    gc.addCoincident(a_root_u.centerSketchPoint, C_sp)
+    off_dim(st_['cur'], G, mirror=True)
+    seed = list(created)
+
+    # ===== 中心まわりの円形パターン =====
+    pin = gc.createCircularPatternInput(seed, C_sp)
+    pin.quantity = VI(str(d['z']))
+    pin.totalAngle = VI('360 deg')
+    gc.addCircularPattern(pin)
+
+    # ===== 軸穴 =====
+    if prm.get('hole', 0) > 1e-9:
+        hc = circles.addByCenterRadius(C_sp, prm['hole'] / 2)
+        dims.addDiameterDimension(hc, adsk.core.Point3D.create(C.x + prm['hole'] * 0.3, C.y + prm['hole'] * 0.3, 0))
+        created.append(hc)
+
+    for c in created:
+        _tag(c, pre)
+    keep = {k: prm[k] for k in ('module', 'teeth', 'pa', 'shift', 'ha', 'hf', 'root_r', 'thin', 'hole') if k in prm}
+    keep['prefix'] = pre
+    a = centerline.attributes.itemByName(ATTR_GROUP, ATTR_GEAR)
+    if a:
+        a.value = json.dumps(keep)
+    else:
+        centerline.attributes.add(ATTR_GROUP, ATTR_GEAR, json.dumps(keep))
+    return {'prefix': pre, 'teeth': d['z'], 'd': d, 'centerline': centerline, 'pitch': pitch}
+
+
+def _pattern_owner_prefix(entity, sketch):
+    """パターンで増えた要素なら、元の要素のプレフィックスを返す。"""
+    pat_types = (adsk.fusion.RectangularPatternConstraint.classType(),
+                 adsk.fusion.CircularPatternConstraint.classType())
+    for i in range(sketch.geometricConstraints.count):
+        g = sketch.geometricConstraints.item(i)
+        if g.objectType not in pat_types:
+            continue
+        try:
+            ents = list(g.entities)
+            pre = _attr(ents[0], ATTR_MEMBER) if ents else None
+            if pre and any(c == entity for c in g.createdEntities):
+                return pre
+        except Exception:
+            continue
+    return None
+
+
+def find_gear(entity):
+    """選択要素が既存ギアの一部(または中心線)なら (sketch, center, centerline, pitch, prefix, params) を返す。"""
+    sk = entity.parentSketch
+    v = _attr(entity, ATTR_GEAR)
+    if v:
+        cl = entity
+    else:
+        pre = _attr(entity, ATTR_MEMBER) or _pattern_owner_prefix(entity, sk)
+        if not pre:
+            return None
+        cl = None
+        for ln in sk.sketchCurves.sketchLines:
+            v = _attr(ln, ATTR_GEAR)
+            if v and json.loads(v).get('prefix') == pre:
+                cl = ln
+                break
+        if cl is None:
+            return None
+    prm = json.loads(_attr(cl, ATTR_GEAR))
+    C_sp = cl.startSketchPoint
+    pitch = None
+    for c in sk.sketchCurves.sketchCircles:
+        if c.isConstruction and c.centerSketchPoint == C_sp:
+            for gcn in cl.endSketchPoint.geometricConstraints:
+                if gcn.objectType == adsk.fusion.CoincidentConstraint.classType() and gcn.entity == c:
+                    pitch = c
+    return sk, C_sp, cl, pitch, prm['prefix'], prm
+
+
+def delete_gear(sketch, pre):
+    """中心点・中心線・ピッチ円を残して、歯・パターン・軸穴・寸法を削除する。"""
+    des = adsk.fusion.Design.cast(sketch.parentComponent.parentDesign)
+    members = []
+    for i in range(sketch.geometricConstraints.count - 1, -1, -1):
+        g = sketch.geometricConstraints.item(i)
+        if g.objectType != adsk.fusion.CircularPatternConstraint.classType():
+            continue
+        ents = list(g.entities)
+        if ents and _attr(ents[0], ATTR_MEMBER) == pre:
+            members.extend(list(g.createdEntities))
+            g.deleteMe()
+    for a in des.findAttributes(ATTR_GROUP, ATTR_MEMBER):
+        if a.value == pre and a.parent is not None:
+            members.append(a.parent)
+    for e in members:
+        try:
+            if e.isValid:
+                e.deleteMe()
+        except Exception:
+            pass
 # ==== GEOMETRY END ====
 
 
@@ -819,22 +1218,209 @@ class ValidateHandler(adsk.core.ValidateInputsEventHandler):
             args.areInputsValid = False
 
 
+# ---------------------------------------------------------------------------
+# 平歯車コマンド UI
+# ---------------------------------------------------------------------------
+
+SPUR_CMD_ID = 'GearSketch_Spur'
+SPUR_CMD_NAME = '平歯車 (モジュール指定)'
+
+
+def _spur_target(sel):
+    if sel.selectionCount != 1:
+        return None
+    try:
+        return find_gear(sel.selection(0).entity)
+    except Exception:
+        return None
+
+
+def _spur_params(inp):
+    v = lambda i: inp.itemById(i).value
+    return {
+        'module': v('module'), 'teeth': v('teeth'), 'pa': v('pa'), 'shift': v('shift'),
+        'angle': v('angle'), 'hole': v('hole'),
+        'ha': v('ha'), 'hf': v('hf'), 'root_r': v('root_r'), 'thin': v('thin'),
+    }
+
+
+def _spur_load(inputs, target):
+    sk, C_sp, cl, pitch, pre, prm = target
+    for k in ('module', 'pa', 'hole', 'thin'):
+        if k in prm:
+            inputs.itemById(k).value = prm[k]
+    for k in ('shift', 'ha', 'hf', 'root_r'):
+        if k in prm:
+            inputs.itemById(k).value = prm[k]
+    if 'teeth' in prm:
+        inputs.itemById('teeth').value = int(prm['teeth'])
+    inputs.itemById('status').text = '既存のギア {} を編集します。OK で同じ中心・中心線・ピッチ円のまま作り直します。'.format(pre)
+
+
+def _spur_info(d, pre):
+    return ('{p}: 歯数 {z} / ピッチ円直径 {dp:.3f} mm / 歯先円直径 {da:.3f} mm / 歯底円直径 {df:.3f} mm。'
+            '相手ギア(歯数 z2)との中心距離は m×({z}+z2)/2 (転位なしの場合)。').format(
+        p=pre, z=d['z'], dp=2 * d['r'] * 10, da=2 * d['ra'] * 10, df=2 * d['rf'] * 10)
+
+
+def _spur_center(sel, sketch):
+    e = sel.selection(0).entity
+    t = e.objectType
+    if t == adsk.fusion.SketchPoint.classType():
+        if e.parentSketch == sketch:
+            return e
+        return sketch.sketchPoints.add(sketch.modelToSketchSpace(e.worldGeometry))
+    if t in (adsk.fusion.SketchCircle.classType(), adsk.fusion.SketchArc.classType()):
+        c = e.centerSketchPoint
+        if e.parentSketch == sketch:
+            return c
+        return sketch.sketchPoints.add(sketch.modelToSketchSpace(c.worldGeometry))
+    return None
+
+
+def _spur_do(inputs):
+    status = inputs.itemById('status')
+    sel = inputs.itemById('sel')
+    sketch = _active_sketch()
+    if sketch is None and sel.selectionCount > 0:
+        sketch = sel.selection(0).entity.parentSketch
+    if sketch is None:
+        status.text = 'スケッチを編集中に実行してください'
+        return False
+    prm = _spur_params(inputs)
+    target = _spur_target(sel)
+    try:
+        if target is not None:
+            sk, C_sp, cl, pitch, pre, _old = target
+            draw_spur_param(sk, C_sp, prm, dry_run=True)        # 失敗するなら既存ギアを消さない
+            delete_gear(sk, pre)
+            info = draw_spur_param(sk, C_sp, prm, prefix=pre, centerline=cl, pitch=pitch)
+        else:
+            C_sp = _spur_center(sel, sketch)
+            if C_sp is None:
+                status.text = '中心にする点 (または円) を選んでください'
+                return False
+            draw_spur_param(sketch, C_sp, prm, dry_run=True)
+            info = draw_spur_param(sketch, C_sp, prm)
+    except RackError as e:
+        status.text = str(e)
+        return False
+    status.text = _spur_info(info['d'], info['prefix'])
+    return True
+
+
+class SpurCreatedHandler(adsk.core.CommandCreatedEventHandler):
+    def notify(self, args):
+        try:
+            cmd = args.command
+            inp = cmd.commandInputs
+            VI = adsk.core.ValueInput.createByString
+            s = inp.addSelectionInput('sel', '中心 / 既存ギア', '中心にする点か円、または編集する既存ギアの線を選択')
+            s.addSelectionFilter('SketchPoints')
+            s.addSelectionFilter('SketchCurves')
+            s.setSelectionLimits(1, 1)
+            inp.addValueInput('module', 'モジュール', 'mm', VI('1 mm'))
+            inp.addIntegerSpinnerCommandInput('teeth', '歯数', 4, 10000, 1, 20)
+            inp.addValueInput('pa', '圧力角', 'deg', VI('20 deg'))
+            inp.addFloatSpinnerCommandInput('shift', '転位係数', '', -1.0, 2.0, 0.05, 0.0)
+            inp.addValueInput('angle', '歯の向き (中心線の角度)', 'deg', VI('90 deg'))
+            inp.addValueInput('hole', '軸穴の直径 (0=なし)', 'mm', VI('0 mm'))
+            g = inp.addGroupCommandInput('adv', '詳細 (係数はモジュール倍)')
+            g.isExpanded = False
+            gi = g.children
+            gi.addFloatSpinnerCommandInput('ha', '歯末のたけ係数', '', 0.0, 5.0, 0.05, 1.0)
+            gi.addFloatSpinnerCommandInput('hf', '歯元のたけ係数', '', 0.1, 5.0, 0.05, 1.25)
+            gi.addFloatSpinnerCommandInput('root_r', '歯元R係数', '', 0.0, 1.0, 0.01, 0.38)
+            gi.addValueInput('thin', '歯厚減少量 (バックラッシ用)', 'mm', VI('0 mm'))
+            inp.addTextBoxCommandInput('status', '情報', '', 3, True)
+            for h, ev in ((SpurExecuteHandler(), cmd.execute),
+                          (SpurPreviewHandler(), cmd.executePreview),
+                          (SpurValidateHandler(), cmd.validateInputs),
+                          (SpurInputChangedHandler(), cmd.inputChanged),
+                          (SpurActivateHandler(), cmd.activate)):
+                ev.add(h)
+                _handlers.append(h)
+        except Exception:
+            _ui.messageBox('UI作成に失敗:\n' + traceback.format_exc())
+
+
+class SpurInputChangedHandler(adsk.core.InputChangedEventHandler):
+    def notify(self, args):
+        try:
+            if args.input.id != 'sel':
+                return
+            t = _spur_target(args.inputs.itemById('sel'))
+            if t is not None:
+                _spur_load(args.inputs, t)
+        except Exception:
+            pass
+
+
+class SpurActivateHandler(adsk.core.CommandEventHandler):
+    def notify(self, args):
+        try:
+            inputs = args.command.commandInputs
+            t = _spur_target(inputs.itemById('sel'))
+            if t is not None:
+                _spur_load(inputs, t)
+        except Exception:
+            pass
+
+
+class SpurExecuteHandler(adsk.core.CommandEventHandler):
+    def notify(self, args):
+        try:
+            inputs = args.command.commandInputs
+            if not _spur_do(inputs):
+                _ui.messageBox(inputs.itemById('status').text)
+        except Exception:
+            _ui.messageBox('平歯車の作成に失敗しました:\n' + traceback.format_exc())
+
+
+class SpurPreviewHandler(adsk.core.CommandEventHandler):
+    def notify(self, args):
+        inputs = args.command.commandInputs
+        try:
+            args.isValidResult = _spur_do(inputs)
+        except Exception as e:
+            inputs.itemById('status').text = 'エラー: {}'.format(e)
+
+
+class SpurValidateHandler(adsk.core.ValidateInputsEventHandler):
+    def notify(self, args):
+        try:
+            i = args.inputs
+            args.areInputsValid = i.itemById('sel').selectionCount == 1 and i.itemById('module').value > 0
+        except Exception:
+            args.areInputsValid = False
+
+
+# ---------------------------------------------------------------------------
+# 登録
+# ---------------------------------------------------------------------------
+
+_COMMANDS = [
+    (CMD_ID, CMD_NAME, '選んだ線(2点)に沿って、指定モジュールのラック歯形をスケッチします', CreatedHandler),
+    (SPUR_CMD_ID, SPUR_CMD_NAME, '選んだ点を中心に、指定モジュール・歯数の平歯車をスケッチします', SpurCreatedHandler),
+]
+
+
 def run(context):
     global _app, _ui
     try:
         _app = adsk.core.Application.get()
         _ui = _app.userInterface
-        d = _ui.commandDefinitions.itemById(CMD_ID)
-        if d:
-            d.deleteMe()
-        d = _ui.commandDefinitions.addButtonDefinition(
-            CMD_ID, CMD_NAME, '選んだ2点の間に、指定モジュールのラック歯形をスケッチします')
-        h = CreatedHandler()
-        d.commandCreated.add(h)
-        _handlers.append(h)
         panel = _ui.allToolbarPanels.itemById(PANEL_ID)
-        if panel and not panel.controls.itemById(CMD_ID):
-            panel.controls.addCommand(d)
+        for cid, name, tip, handler_cls in _COMMANDS:
+            d = _ui.commandDefinitions.itemById(cid)
+            if d:
+                d.deleteMe()
+            d = _ui.commandDefinitions.addButtonDefinition(cid, name, tip)
+            h = handler_cls()
+            d.commandCreated.add(h)
+            _handlers.append(h)
+            if panel and not panel.controls.itemById(cid):
+                panel.controls.addCommand(d)
     except Exception:
         if _ui:
             _ui.messageBox('GearSketch の起動に失敗:\n' + traceback.format_exc())
@@ -843,11 +1429,12 @@ def run(context):
 def stop(context):
     try:
         panel = _ui.allToolbarPanels.itemById(PANEL_ID)
-        c = panel.controls.itemById(CMD_ID) if panel else None
-        if c:
-            c.deleteMe()
-        d = _ui.commandDefinitions.itemById(CMD_ID)
-        if d:
-            d.deleteMe()
+        for cid, _n, _t, _h in _COMMANDS:
+            c = panel.controls.itemById(cid) if panel else None
+            if c:
+                c.deleteMe()
+            d = _ui.commandDefinitions.itemById(cid)
+            if d:
+                d.deleteMe()
     except Exception:
         pass
