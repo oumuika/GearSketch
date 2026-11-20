@@ -1009,6 +1009,18 @@ def _set_pitch_diameter(sketch, pitch, r):
     return False
 
 
+def _gear_center_after_delete(C_sp, centerline, pitch):
+    """軸穴の円などを消すと、共有していた中心点の参照が無効になることがあるので取り直す。"""
+    for get in (lambda: pitch.centerSketchPoint, lambda: centerline.startSketchPoint, lambda: C_sp):
+        try:
+            p = get()
+            if p is not None and p.isValid:
+                return p
+        except Exception:
+            continue
+    raise GearError('ギアの中心点が見つかりません')
+
+
 def _pattern_owner_prefix(entity, sketch):
     """パターンで増えた要素なら、元の要素のプレフィックスを返す。"""
     pat_types = (adsk.fusion.RectangularPatternConstraint.classType(),
@@ -1428,6 +1440,7 @@ def _spur_do(inputs):
             sk, C_sp, cl, pitch, pre, _old = target
             draw(sk, C_sp, prm, dry_run=True)        # 失敗するなら既存ギアを消さない
             delete_gear(sk, pre)
+            C_sp = _gear_center_after_delete(C_sp, cl, pitch)
             info = draw(sk, C_sp, prm, prefix=pre, centerline=cl, pitch=pitch)
         else:
             C_sp = _spur_center(sel, sketch)
